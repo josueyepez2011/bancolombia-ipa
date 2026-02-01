@@ -1,0 +1,148 @@
+name: Build and Deploy iOS
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Tipo de build'
+        required: true
+        default: 'unsigned'
+        type: choice
+        options:
+        - unsigned
+        - signed
+
+env:
+  FLUTTER_VERSION: '3.24.0'
+
+jobs:
+  build-ios:
+    runs-on: macos-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        
+    - name: Setup Flutter
+      uses: subosito/flutter-action@v2
+      with:
+        flutter-version: ${{ env.FLUTTER_VERSION }}
+        channel: 'stable'
+        cache: true
+        
+    - name: Get Flutter dependencies
+      run: flutter pub get
+      
+    - name: Generate code
+      run: flutter packages pub run build_runner build --delete-conflicting-outputs
+      
+    - name: Analyze code
+      run: flutter analyze
+      
+    - name: Run tests
+      run: flutter test --coverage
+      
+    - name: Setup Xcode
+      uses: maxim-lobanov/setup-xcode@v1
+      with:
+        xcode-version: latest-stable
+        
+    - name: Setup iOS signing (if signed build)
+      if: ${{ github.event.inputs.build_type == 'signed' || github.ref_type == 'tag' }}
+      env:
+        IOS_CERTIFICATE_BASE64: ${{ secrets.IOS_CERTIFICATE_BASE64 }}
+        IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+        IOS_PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+        KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+      run: |
+        # Create variables
+        CERTIFICATE_PATH=$RUNNER_TEMP/build_certificate.p12
+        PP_PATH=$RUNNER_TEMP/build_pp.mobileprovision
+        KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+
+        # Import certificate and provisioning profile from secrets
+        echo -n "$IOS_CERTIFICATE_BASE64" | base64 --decode -o $CERTIFICATE_PATH
+        echo -n "$IOS_PROVISIONING_PROFILE_BASE64" | base64 --decode -o $PP_PATH
+
+        # Create temporary keychain
+        security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+        security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
+        security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+
+        # Import certificate to keychain
+        security import $CERTIFICATE_PATH -P "$IOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+        security list-keychain -d user -s $KEYCHAIN_PATH
+
+        # Apply provisioning profile
+        mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+        cp $PP_PATH ~/Library/MobileDevice/Provisioning\ Profiles
+        
+    - name: Build iOS (unsigned)
+      if: ${{ github.event.inputs.build_type == 'unsigned' || github.event.inputs.build_type == '' }}
+      run: |
+        flutter build ios --release --no-codesign
+        
+    - name: Build iOS (signed) and create IPA
+      if: ${{ github.event.inputs.build_type == 'signed' || github.ref_type == 'tag' }}
+      run: |
+        flutter build ios --release
+        
+        cd ios
+        xcodebuild -workspace Runner.xcworkspace \
+                   -scheme Runner \
+                   -configuration Release \
+                   -destination generic/platform=iOS \
+                   -archivePath $RUNNER_TEMP/bancolombia_v3.xcarchive \
+                   archive
+                   
+        xcodebuild -exportArchive \
+                   -archivePath $RUNNER_TEMP/bancolombia_v3.xcarchive \
+                   -exportOptionsPlist Runner/ExportOptions.plist \
+                   -exportPath $RUNNER_TEMP/build
+                   
+    - name: Upload unsigned build
+      if: ${{ github.event.inputs.build_type == 'unsigned' || github.event.inputs.build_type == '' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: bancolombia_v3-ios-unsigned-${{ github.sha }}
+        path: build/ios/iphoneos/Runner.app
+        retention-days: 7
+        
+    - name: Upload signed IPA
+      if: ${{ github.event.inputs.build_type == 'signed' || github.ref_type == 'tag' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: bancolombia_v3-ios-signed-${{ github.sha }}
+        path: ${{ runner.temp }}/build/*.ipa
+        retention-days: 30
+        
+    - name: Create Release (for tags)
+      if: ${{ github.ref_type == 'tag' }}
+      uses: softprops/action-gh-release@v1
+      with:
+        files: ${{ runner.temp }}/build/*.ipa
+        draft: false
+        prerelease: false
+        generate_release_notes: true
+        
+    - name: Clean up keychain
+      if: ${{ always() && (github.event.inputs.build_type == 'signed' || github.ref_type == 'tag') }}
+      run: |
+        security delete-keychain $RUNNER_TEMP/app-signing.keychain-db || true
+        
+    - name: Build summary
+      run: |
+        echo "## 🍎 iOS Build Summary" >> $GITHUB_STEP_SUMMARY
+        echo "- **Flutter Version:** ${{ env.FLUTTER_VERSION }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Build Type:** ${{ github.event.inputs.build_type || 'unsigned' }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Branch:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+        if [ -d "build/ios/iphoneos" ]; then
+          echo "- **Build Size:** $(du -sh build/ios/iphoneos/Runner.app | cut -f1)" >> $GITHUB_STEP_SUMMARY
+        fi
+        echo "✅ Build completed successfully!" >> $GITHUB_STEP_SUMMARY
